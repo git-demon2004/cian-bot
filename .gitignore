@@ -1,0 +1,28 @@
+# Секреты и конфиги
+.env
+credentials.json
+cian_session.json
+cian_storage/
+notified_chats.json
+
+# Логи
+*.log
+service.log
+
+# Дебаг-скрины
+debug_*.png
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.Python
+
+# Прочее
+*.pdf
+
+# IDE
+.idea/
+.vscode/
+*.swp

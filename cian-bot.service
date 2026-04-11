@@ -1,0 +1,20 @@
+[Unit]
+Description=Cian Auto-Messenger Bot
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/cian-bot
+ExecStartPre=/usr/bin/bash -c 'Xvfb :99 -screen 0 1280x800x24 &'
+ExecStart=/home/ubuntu/cian-bot/venv/bin/python main.py
+Restart=always
+RestartSec=30
+Environment=DISPLAY=:99
+
+# Логи
+StandardOutput=append:/home/ubuntu/cian-bot/service.log
+StandardError=append:/home/ubuntu/cian-bot/service.log
+
+[Install]
+WantedBy=multi-user.target
