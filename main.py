@@ -58,6 +58,11 @@ def task_send_messages():
     days_between = int(os.getenv("DAYS_BETWEEN_MESSAGES", 3))
 
     try:
+        sheets.apply_stop_list()
+    except Exception as e:
+        logger.error(f"Ошибка обработки листа Стоп: {e}")
+
+    try:
         pending = sheets.get_pending_sends(days_between)
     except Exception as e:
         logger.error(f"Ошибка чтения Google Sheets: {e}")

@@ -1,10 +1,14 @@
 """
 Telegram бот — слушает сообщения в супергруппе.
-Если участник отвечает в теме собственника, пересылает ответ на Циан.
+
+Функции:
+- Любое сообщение в теме → пересылается на Циан
+- /стоп — останавливает рассылку по объявлению и добавляет в лист Стоп
 """
 import logging
 import os
 import threading
+from datetime import datetime
 
 import requests
 
@@ -18,10 +22,38 @@ def _get_config():
 
 
 def _send_to_cian(offer_url: str, text: str) -> bool:
-    """Отправляет сообщение на Циан."""
     import cian_api
     result = cian_api.send_message(offer_url, text)
     return result["success"]
+
+
+def _handle_stop_command(topic_id: int, offer_url: str, sender_name: str):
+    """Добавляет объявление в лист Стоп и останавливает рассылку."""
+    import sheets
+    import telegram_notify
+
+    try:
+        # Добавляем в лист Стоп
+        sp = sheets._get_spreadsheet()
+        stop_sheet = sp.worksheet("Стоп")
+        stop_sheet.append_row([
+            offer_url,
+            f"Остановлено вручную ({sender_name})",
+            datetime.now().strftime("%Y-%m-%d %H:%M"),
+        ])
+
+        # Помечаем в Рассылке как paused + серый цвет
+        sheets.apply_stop_list()
+
+        telegram_notify.send_to_topic(
+            topic_id,
+            f"Рассылка остановлена. Объявление добавлено в лист Стоп.",
+        )
+        logger.info(f"/стоп от {sender_name}: {offer_url}")
+    except Exception as e:
+        logger.error(f"Ошибка команды /стоп: {e}")
+        import telegram_notify
+        telegram_notify.send_to_topic(topic_id, f"Ошибка: {e}")
 
 
 def _process_update(update: dict):
@@ -52,24 +84,34 @@ def _process_update(update: dict):
     if not text:
         return
 
+    sender_name = from_user.get("first_name", "Участник")
+
     # Ищем offer по topic_id
     import sheets
     offer_url = sheets.get_offer_url_by_topic(topic_id)
+
+    # Обработка команд
+    if text.lower() in ("/стоп", "/stop", "/стоп@" + token.split(":")[0]):
+        if not offer_url:
+            import telegram_notify
+            telegram_notify.send_to_topic(topic_id, "Объявление не найдено для этой темы.")
+            return
+        _handle_stop_command(topic_id, offer_url, sender_name)
+        return
+
+    # Пересылаем на Циан только если тема привязана к объявлению
     if not offer_url:
         logger.debug(f"Topic {topic_id} не привязан к объявлению")
         return
 
-    sender_name = from_user.get("first_name", "Участник")
-    logger.info(f"Пересылаю на Циан от {sender_name}: {text[:50]}... → {offer_url}")
-
+    logger.info(f"Пересылаю на Циан от {sender_name}: {text[:50]} → {offer_url}")
     success = _send_to_cian(offer_url, text)
 
-    # Уведомляем в тему о результате
     import telegram_notify
     if success:
-        telegram_notify.send_to_topic(topic_id, f"Отправлено на Циан от {sender_name}")
+        telegram_notify.send_to_topic(topic_id, f"Отправлено на Циан.")
     else:
-        telegram_notify.send_to_topic(topic_id, f"Ошибка отправки на Циан")
+        telegram_notify.send_to_topic(topic_id, f"Ошибка отправки на Циан.")
 
 
 def run_polling():
@@ -84,6 +126,7 @@ def run_polling():
     offset = 0
     url = f"https://api.telegram.org/bot{token}/getUpdates"
 
+    import time
     while True:
         try:
             resp = requests.get(
@@ -94,16 +137,17 @@ def run_polling():
 
             if resp.status_code != 200:
                 logger.error(f"Polling ошибка: {resp.status_code}")
+                time.sleep(5)
                 continue
 
             data = resp.json()
             if not data.get("ok"):
+                time.sleep(5)
                 continue
 
             for update in data.get("result", []):
                 update_id = update["update_id"]
                 offset = update_id + 1
-
                 try:
                     _process_update(update)
                 except Exception as e:
@@ -113,12 +157,10 @@ def run_polling():
             continue
         except Exception as e:
             logger.error(f"Polling ошибка: {e}")
-            import time
             time.sleep(5)
 
 
 def start_in_background():
-    """Запускает polling в фоновом потоке."""
     thread = threading.Thread(target=run_polling, daemon=True)
     thread.start()
     logger.info("Telegram polling запущен в фоне")

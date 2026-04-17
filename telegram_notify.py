@@ -99,7 +99,7 @@ def send_to_topic(topic_id: int, text: str):
 
 
 def send_to_general(text: str):
-    """Отправляет сообщение в General тему (без thread_id)."""
+    """Отправляет сообщение в General чат группы."""
     _, group_id = _get_config()
     if not group_id:
         return

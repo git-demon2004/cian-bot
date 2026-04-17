@@ -41,6 +41,73 @@ def _get_sheet() -> gspread.Worksheet:
     return spreadsheet.sheet1
 
 
+def _get_spreadsheet() -> gspread.Spreadsheet:
+    client = _get_client()
+    return client.open_by_key(os.getenv("GOOGLE_SHEET_ID"))
+
+
+def get_stop_urls() -> set:
+    """Возвращает множество нормализованных URL из листа Стоп."""
+    try:
+        sp = _get_spreadsheet()
+        stop_sheet = sp.worksheet("Стоп")
+        rows = stop_sheet.get_all_values()
+        result = set()
+        for row in rows[1:]:
+            url = row[0].strip() if row else ""
+            if url.startswith("http"):
+                result.add(_normalize_url(url))
+        return result
+    except Exception as e:
+        logger.warning(f"Не удалось прочитать лист Стоп: {e}")
+        return set()
+
+
+def apply_stop_list():
+    """
+    Читает лист Стоп и останавливает рассылку по найденным URL:
+    ставит статус 'paused' и красит строку серым в листе Рассылка.
+    """
+    stop_urls = get_stop_urls()
+    if not stop_urls:
+        return
+
+    sheet = _get_sheet()
+    all_rows = sheet.get_all_values()
+    stopped = 0
+
+    for i, row in enumerate(all_rows):
+        if i == 0:
+            continue
+        url = row[COL_URL].strip() if len(row) > COL_URL else ""
+        if not url.startswith("http"):
+            continue
+        status = row[COL_STATUS].strip().lower() if len(row) > COL_STATUS else ""
+        if status in ("paused", "done", "replied", "дубль"):
+            continue
+        if _normalize_url(url) in stop_urls:
+            row_num = i + 1
+            sheet.update_cell(row_num, COL_STATUS + 1, "paused")
+            sheet.update_cell(row_num, COL_NEXT + 1, "—")
+            sheet.format(f"A{row_num}:G{row_num}", {
+                "backgroundColor": {"red": 0.8, "green": 0.8, "blue": 0.8}
+            })
+            logger.info(f"Остановлена рассылка (лист Стоп): {url}")
+            stopped += 1
+
+    if stopped:
+        logger.info(f"Остановлено из листа Стоп: {stopped} объявлений")
+
+
+def _mark_duplicate(sheet, row_num: int):
+    """Красит строку оранжевым и ставит статус 'дубль'."""
+    import gspread.utils
+    sheet.update_cell(row_num, COL_STATUS + 1, "дубль")
+    sheet.format(f"A{row_num}:G{row_num}", {
+        "backgroundColor": {"red": 1.0, "green": 0.6, "blue": 0.0}
+    })
+
+
 def get_pending_sends(days_between: int = 3) -> list[dict]:
     """
     Получает список объявлений, которым пора отправить сообщение.
@@ -52,6 +119,16 @@ def get_pending_sends(days_between: int = 3) -> list[dict]:
     all_rows = sheet.get_all_values()
     today = datetime.now().strftime("%Y-%m-%d")
     pending = []
+
+    # Собираем все URL у которых уже есть статус (не пустой и не дубль)
+    seen_urls = set()
+    for i, row in enumerate(all_rows):
+        if i == 0:
+            continue
+        url = row[COL_URL].strip() if len(row) > COL_URL else ""
+        status = row[COL_STATUS].strip().lower() if len(row) > COL_STATUS else ""
+        if url.startswith("http") and status and status != "дубль":
+            seen_urls.add(_normalize_url(url))
 
     for i, row in enumerate(all_rows):
         if i == 0:  # Пропускаем заголовок
@@ -66,21 +143,31 @@ def get_pending_sends(days_between: int = 3) -> list[dict]:
         sent_count = int(row[COL_SENT]) if len(row) > COL_SENT and row[COL_SENT].isdigit() else 0
         next_send = row[COL_NEXT].strip() if len(row) > COL_NEXT else ""
 
-        # Пропускаем неактивные
-        if status in ("replied", "paused", "done"):
+        # Пропускаем неактивные и дубли
+        if status in ("replied", "paused", "done", "дубль"):
             continue
 
         topic_id = row[COL_TOPIC].strip() if len(row) > COL_TOPIC else ""
 
-        # Если статус пустой — новая ссылка, инициализируем
+        # Если статус пустой — новая ссылка
         if not status:
+            row_num = i + 1  # gspread 1-indexed
+            norm_url = _normalize_url(url)
+
+            # Проверяем дубль
+            if norm_url in seen_urls:
+                logger.warning(f"Дубль: {url} — помечаю оранжевым")
+                _mark_duplicate(sheet, row_num)
+                continue
+
+            # Инициализируем новую ссылку
             added_date = datetime.now().strftime("%Y-%m-%d")
             next_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-            row_num = i + 1  # gspread 1-indexed
             sheet.update_cell(row_num, COL_ADDED + 1, added_date)
             sheet.update_cell(row_num, COL_SENT + 1, "0")
             sheet.update_cell(row_num, COL_NEXT + 1, next_date)
             sheet.update_cell(row_num, COL_STATUS + 1, "active")
+            seen_urls.add(norm_url)
 
             # Создаём тему в Telegram
             import telegram_notify
@@ -142,11 +229,13 @@ def mark_replied(offer_url: str, reply_text: str):
     return False
 
 
+def _normalize_url(url: str) -> str:
+    """Нормализует URL для сравнения."""
+    return url.replace("https://", "").replace("http://", "").replace("www.", "").rstrip("/")
+
+
 def _urls_match(url1: str, url2: str) -> bool:
-    """Нечёткое сравнение URL Циана."""
-    def normalize(u):
-        return u.replace("https://", "").replace("http://", "").replace("www.", "").rstrip("/")
-    return normalize(url1) == normalize(url2)
+    return _normalize_url(url1) == _normalize_url(url2)
 
 
 def get_offer_url_by_topic(topic_id: int) -> str | None:

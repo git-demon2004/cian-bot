@@ -126,21 +126,20 @@ def send_message(offer_url: str, message_text: str) -> dict:
 def _send_first_via_hint(session: requests.Session, offer_id: int, message_text: str) -> dict:
     """
     Отправляет первое сообщение с analyticsKey для обхода капчи.
-    После создания чата отправляет кастомный текст.
+    Текст шаблона передаётся напрямую — лишних сообщений нет.
     """
     result = {"success": False, "error": None}
 
-    # Шаг 1: создаём чат через hint-сообщение
-    hint_payload = {
+    payload = {
         "offerId": offer_id,
-        "text": "Здравствуйте. Подскажите, пожалуйста, когда можно посмотреть квартиру?",
+        "text": message_text,
         "analyticsKey": "whenSee",
     }
 
     try:
         resp = session.post(
             f"{API_BASE}/messages/offer/",
-            json=hint_payload,
+            json=payload,
             timeout=15,
         )
     except Exception as e:
@@ -153,24 +152,7 @@ def _send_first_via_hint(session: requests.Session, offer_id: int, message_text:
         logger.error(result["error"])
         return result
 
-    logger.info(f"Чат создан через hint: offerId={offer_id}")
-
-    # Шаг 2: если кастомный текст отличается от hint — отправляем его тоже
-    hint_text = hint_payload["text"]
-    if message_text != hint_text:
-        try:
-            resp2 = session.post(
-                f"{API_BASE}/messages/offer/",
-                json={"offerId": offer_id, "text": message_text},
-                timeout=15,
-            )
-            if resp2.status_code == 200:
-                logger.info(f"Кастомное сообщение отправлено: offerId={offer_id}")
-            else:
-                logger.warning(f"Кастомное сообщение не отправлено: {resp2.status_code}")
-        except Exception as e:
-            logger.warning(f"Ошибка отправки кастомного сообщения: {e}")
-
+    logger.info(f"Сообщение отправлено через hint: offerId={offer_id}")
     result["success"] = True
     return result
 
@@ -218,12 +200,35 @@ def _get_browser_context():
 def check_replies() -> list[dict]:
     """
     Проверяет непрочитанные сообщения через браузер.
-    Открывает /dialogs/, парсит список чатов, находит непрочитанные,
-    кликает и читает ответы собственников.
+    Запускает браузер в отдельном потоке, чтобы избежать конфликта
+    sync_playwright с asyncio event loop из APScheduler.
 
     Возвращает:
         [{"offer_url": str, "reply_text": str, "sender": str}, ...]
     """
+    import threading
+
+    result_holder = []
+    error_holder = []
+
+    def _run_in_thread():
+        try:
+            result_holder.extend(_check_replies_impl())
+        except Exception as e:
+            error_holder.append(e)
+
+    t = threading.Thread(target=_run_in_thread, daemon=True)
+    t.start()
+    t.join(timeout=300)  # макс 5 минут
+
+    if error_holder:
+        raise error_holder[0]
+
+    return result_holder
+
+
+def _check_replies_impl() -> list[dict]:
+    """Внутренняя реализация проверки ответов (выполняется в чистом потоке)."""
     import re
     import time
 
