@@ -155,6 +155,15 @@ def task_check_replies():
             )
 
 
+def task_process_collections():
+    """Задача: парсинг подборок из листа Подборки → добавление в Базу."""
+    logger.info("📋 Проверяю лист Подборки...")
+    try:
+        sheets.process_collections()
+    except Exception as e:
+        logger.error(f"Ошибка обработки подборок: {e}")
+
+
 def task_daily_stats():
     """Задача: ежедневная сводка."""
     try:
@@ -205,7 +214,16 @@ def main():
         name="Проверка ответов",
     )
 
-    # 3. Дневная сводка — в 20:00
+    # 3. Парсинг подборок — каждые 30 минут
+    scheduler.add_job(
+        task_process_collections,
+        "interval",
+        minutes=30,
+        id="process_collections",
+        name="Парсинг подборок",
+    )
+
+    # 4. Дневная сводка — в 20:00
     scheduler.add_job(
         task_daily_stats,
         "cron",

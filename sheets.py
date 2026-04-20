@@ -87,8 +87,7 @@ def apply_stop_list():
             continue
         if _normalize_url(url) in stop_urls:
             row_num = i + 1
-            sheet.update_cell(row_num, COL_STATUS + 1, "paused")
-            sheet.update_cell(row_num, COL_NEXT + 1, "—")
+            sheet.update(values=[["paused", "—"]], range_name=f"E{row_num}:F{row_num}")
             sheet.format(f"A{row_num}:G{row_num}", {
                 "backgroundColor": {"red": 0.8, "green": 0.8, "blue": 0.8}
             })
@@ -100,9 +99,8 @@ def apply_stop_list():
 
 
 def _mark_duplicate(sheet, row_num: int):
-    """Красит строку оранжевым и ставит статус 'дубль'."""
-    import gspread.utils
-    sheet.update_cell(row_num, COL_STATUS + 1, "дубль")
+    """Красит строку оранжевым и ставит статус 'дубль' — один batch-запрос."""
+    sheet.update(values=[["дубль"]], range_name=f"E{row_num}")
     sheet.format(f"A{row_num}:G{row_num}", {
         "backgroundColor": {"red": 1.0, "green": 0.6, "blue": 0.0}
     })
@@ -115,9 +113,14 @@ def get_pending_sends(days_between: int = 3) -> list[dict]:
     Возвращает:
         [{"row": int, "url": str, "sent_count": int}, ...]
     """
+    import time as _time
+    import telegram_notify
+
     sheet = _get_sheet()
     all_rows = sheet.get_all_values()
     today = datetime.now().strftime("%Y-%m-%d")
+    added_date = datetime.now().strftime("%Y-%m-%d")
+    next_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
     pending = []
 
     # Собираем все URL у которых уже есть статус (не пустой и не дубль)
@@ -130,55 +133,57 @@ def get_pending_sends(days_between: int = 3) -> list[dict]:
         if url.startswith("http") and status and status != "дубль":
             seen_urls.add(_normalize_url(url))
 
+    # Собираем новые ссылки для batch-инициализации
+    new_rows = []
     for i, row in enumerate(all_rows):
-        if i == 0:  # Пропускаем заголовок
+        if i == 0:
             continue
-
-        # Пропускаем пустые строки
         url = row[COL_URL].strip() if len(row) > COL_URL else ""
         if not url or not url.startswith("http"):
             continue
-
         status = row[COL_STATUS].strip().lower() if len(row) > COL_STATUS else ""
-        sent_count = int(row[COL_SENT]) if len(row) > COL_SENT and row[COL_SENT].isdigit() else 0
-        next_send = row[COL_NEXT].strip() if len(row) > COL_NEXT else ""
-
-        # Пропускаем неактивные и дубли
-        if status in ("replied", "paused", "done", "дубль"):
-            continue
-
-        topic_id = row[COL_TOPIC].strip() if len(row) > COL_TOPIC else ""
-
-        # Если статус пустой — новая ссылка
         if not status:
-            row_num = i + 1  # gspread 1-indexed
             norm_url = _normalize_url(url)
-
-            # Проверяем дубль
             if norm_url in seen_urls:
-                logger.warning(f"Дубль: {url} — помечаю оранжевым")
-                _mark_duplicate(sheet, row_num)
-                continue
+                _mark_duplicate(sheet, i + 1)
+            else:
+                new_rows.append((i + 1, url, norm_url))
+                seen_urls.add(norm_url)
 
-            # Инициализируем новую ссылку
-            added_date = datetime.now().strftime("%Y-%m-%d")
-            next_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
-            sheet.update_cell(row_num, COL_ADDED + 1, added_date)
-            sheet.update_cell(row_num, COL_SENT + 1, "0")
-            sheet.update_cell(row_num, COL_NEXT + 1, next_date)
-            sheet.update_cell(row_num, COL_STATUS + 1, "active")
-            seen_urls.add(norm_url)
+    # Batch-инициализация: одним запросом обновляем B:E для всех новых строк
+    if new_rows:
+        batch_data = []
+        for row_num, url, _ in new_rows:
+            batch_data.append({
+                "range": f"B{row_num}:E{row_num}",
+                "values": [[added_date, "0", next_date, "active"]],
+            })
+        sheet.spreadsheet.values_batch_update({"valueInputOption": "RAW", "data": batch_data})
+        logger.info(f"Инициализировано {len(new_rows)} новых ссылок (batch)")
 
-            # Создаём тему в Telegram
-            import telegram_notify
+        # Создаём темы в Telegram — по одной, с паузой чтоб не словить 429
+        for row_num, url, _ in new_rows:
+            _time.sleep(1)
             new_topic_id = telegram_notify.create_topic(url)
             if new_topic_id:
-                sheet.update_cell(row_num, COL_TOPIC + 1, str(new_topic_id))
+                sheet.update(values=[[str(new_topic_id)]], range_name=f"G{row_num}")
+            logger.info(f"Инициализирована: {url}")
 
-            logger.info(f"Инициализирована новая ссылка: {url}")
-            continue  # Первая отправка — завтра
+    # Собираем pending — только активные с наступившей датой
+    all_rows = sheet.get_all_values()  # перечитываем после обновлений
+    for i, row in enumerate(all_rows):
+        if i == 0:
+            continue
+        url = row[COL_URL].strip() if len(row) > COL_URL else ""
+        if not url or not url.startswith("http"):
+            continue
+        status = row[COL_STATUS].strip().lower() if len(row) > COL_STATUS else ""
+        if status != "active":
+            continue
+        sent_count = int(row[COL_SENT]) if len(row) > COL_SENT and row[COL_SENT].isdigit() else 0
+        next_send = row[COL_NEXT].strip() if len(row) > COL_NEXT else ""
+        topic_id = row[COL_TOPIC].strip() if len(row) > COL_TOPIC else ""
 
-        # Проверяем, пора ли отправлять
         if next_send and next_send <= today and sent_count < 20:
             pending.append({
                 "row": i + 1,
@@ -192,11 +197,15 @@ def get_pending_sends(days_between: int = 3) -> list[dict]:
 
 
 def mark_sent(row: int, new_sent_count: int, days_between: int = 3):
-    """Отмечает успешную отправку сообщения."""
+    """Отмечает успешную отправку — один batch-запрос."""
     sheet = _get_sheet()
     next_date = (datetime.now() + timedelta(days=days_between)).strftime("%Y-%m-%d")
 
-    sheet.update_cell(row, COL_SENT + 1, str(new_sent_count))
+    if new_sent_count >= 20:
+        sheet.update(values=[[str(new_sent_count), "—", "done"]], range_name=f"C{row}:E{row}")
+        logger.info(f"Строка {row}: все 20 сообщений отправлены, статус → done")
+    else:
+        sheet.update(values=[[str(new_sent_count), next_date]], range_name=f"C{row}:D{row}")
     sheet.update_cell(row, COL_NEXT + 1, next_date)
 
     # Если отправили 20 сообщений — помечаем done
@@ -219,9 +228,7 @@ def mark_replied(offer_url: str, reply_text: str):
         # Сравниваем URL (может быть с/без www, с/без слеша)
         if _urls_match(url, offer_url):
             row_num = i + 1
-            sheet.update_cell(row_num, COL_STATUS + 1, "replied")
-            sheet.update_cell(row_num, COL_NEXT + 1, "—")
-            sheet.update_cell(row_num, COL_REPLY + 1, reply_text[:100])
+            sheet.update(values=[["replied", "—", reply_text[:100]]], range_name=f"E{row_num}:G{row_num}")
             logger.info(f"Строка {row_num}: собственник ответил, статус → replied")
             return True
 
@@ -288,3 +295,136 @@ def get_stats() -> dict:
             stats[status] += 1
 
     return stats
+
+
+def _parse_collection_offer_ids(url: str) -> list[str]:
+    """Парсит подборку Циан и возвращает список offerIds через браузер."""
+    import json
+    import re
+    import time
+    from pathlib import Path
+    from playwright.sync_api import sync_playwright
+
+    offer_ids = []
+    session_file = os.getenv("CIAN_SESSION_FILE", "cian_session.json")
+
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir="cian_storage",
+            headless=True,
+            viewport={"width": 1280, "height": 900},
+            locale="ru-RU",
+            timezone_id="Europe/Moscow",
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            args=["--no-sandbox", "--disable-gpu", "--disable-blink-features=AutomationControlled"],
+            ignore_default_args=["--enable-automation"],
+        )
+
+        if Path(session_file).exists():
+            with open(session_file) as f:
+                cookies = json.load(f)
+            valid = []
+            for c in cookies:
+                if c.get("sameSite") not in ("Strict", "Lax", "None"):
+                    c["sameSite"] = "Lax"
+                valid.append(c)
+            context.add_cookies(valid)
+
+        page = context.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        time.sleep(5)
+
+        for _ in range(15):
+            page.evaluate("window.scrollBy(0, 800)")
+            time.sleep(0.5)
+
+        html = page.content()
+        offer_ids = list(dict.fromkeys(re.findall(r'"offerId":(\d+)', html)))
+        context.close()
+
+    return offer_ids
+
+
+def process_collections():
+    """
+    Читает лист Подборки, парсит новые подборки Циан,
+    добавляет ссылки в лист База (без дублей).
+    """
+    sp = _get_spreadsheet()
+
+    try:
+        col_sheet = sp.worksheet("Подборки")
+    except Exception:
+        logger.warning("Лист Подборки не найден")
+        return
+
+    try:
+        base_sheet = sp.worksheet("База")
+    except Exception:
+        base_sheet = sp.add_worksheet(title="База", rows=2000, cols=2)
+        base_sheet.update_cell(1, 1, "Ссылка")
+
+    rows = col_sheet.get_all_values()
+
+    # Существующие URL в листе База (для дедупликации)
+    base_rows = base_sheet.get_all_values()
+    existing_urls = set()
+    for r in base_rows[1:]:
+        if r and r[0].startswith("http"):
+            existing_urls.add(_normalize_url(r[0].strip()))
+
+    for i, row in enumerate(rows[1:], 2):
+        col_url = row[0].strip() if row else ""
+        status = row[1].strip().lower() if len(row) > 1 else ""
+
+        if not col_url.startswith("http"):
+            continue
+        if status in ("обработано", "ошибка"):
+            continue
+
+        logger.info(f"Парсю подборку: {col_url}")
+        col_sheet.update_cell(i, 2, "парсинг...")
+        col_sheet.update_cell(i, 3, datetime.now().strftime("%Y-%m-%d %H:%M"))
+
+        try:
+            def _run():
+                return _parse_collection_offer_ids(col_url)
+
+            import threading
+            result = []
+            err = []
+            t = threading.Thread(target=lambda: result.extend(_run()) or True)
+            t.start()
+            t.join(timeout=180)
+
+            offer_ids = result
+            if not offer_ids:
+                col_sheet.update_cell(i, 2, "ошибка")
+                col_sheet.update_cell(i, 4, "0")
+                continue
+
+            # Фильтруем дубли
+            new_urls = []
+            for oid in offer_ids:
+                url_norm = _normalize_url(f"www.cian.ru/sale/flat/{oid}/")
+                if url_norm not in existing_urls:
+                    new_urls.append(f"https://www.cian.ru/sale/flat/{oid}/")
+                    existing_urls.add(url_norm)
+
+            # Добавляем в конец листа База
+            if new_urls:
+                next_row = len(base_rows) + 1
+                base_sheet.update(
+                    values=[[u] for u in new_urls],
+                    range_name=f"A{next_row}:A{next_row + len(new_urls) - 1}",
+                )
+                base_rows.extend([[u] for u in new_urls])
+
+            col_sheet.update_cell(i, 2, "обработано")
+            col_sheet.update_cell(i, 4, str(len(new_urls)))
+            logger.info(f"Подборка {col_url}: добавлено {len(new_urls)} новых из {len(offer_ids)}")
+
+        except Exception as e:
+            logger.error(f"Ошибка парсинга подборки {col_url}: {e}")
+            col_sheet.update_cell(i, 2, "ошибка")
+            col_sheet.update_cell(i, 4, str(e)[:50])
