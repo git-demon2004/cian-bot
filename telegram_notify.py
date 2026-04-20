@@ -18,6 +18,13 @@ def _get_config():
     return token, group_id
 
 
+def _get_proxies() -> dict | None:
+    proxy = os.getenv("SOCKS5_PROXY")
+    if proxy:
+        return {"http": f"socks5://{proxy}", "https": f"socks5://{proxy}"}
+    return None
+
+
 def _api(method: str, **params) -> dict | None:
     """Вызов Telegram Bot API."""
     token, _ = _get_config()
@@ -27,7 +34,7 @@ def _api(method: str, **params) -> dict | None:
 
     url = f"https://api.telegram.org/bot{token}/{method}"
     try:
-        resp = requests.post(url, json=params, timeout=15)
+        resp = requests.post(url, json=params, timeout=15, proxies=_get_proxies())
         data = resp.json()
         if not data.get("ok"):
             logger.error(f"Telegram API {method}: {data}")
@@ -74,8 +81,8 @@ def create_topic(offer_url: str, offer_info: str = "") -> int | None:
             topic_id,
             f"<b>Новое объявление взято в работу</b>\n\n"
             f"<a href=\"{offer_url}\">Открыть на Циан</a>\n\n"
-            f"Первое сообщение будет отправлено завтра в 12:00 МСК.\n"
-            f"Далее — каждые 3 дня, до 20 сообщений.",
+            f"Первое сообщение будет отправлено сегодня в 12:00 МСК (или завтра, если время уже прошло).\n"
+            f"Далее — раз в {os.getenv('DAYS_BETWEEN_MESSAGES', '3')} дня, до 20 сообщений.",
         )
         return topic_id
 

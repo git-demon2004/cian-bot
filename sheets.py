@@ -120,7 +120,7 @@ def get_pending_sends(days_between: int = 3) -> list[dict]:
     all_rows = sheet.get_all_values()
     today = datetime.now().strftime("%Y-%m-%d")
     added_date = datetime.now().strftime("%Y-%m-%d")
-    next_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+    next_date = datetime.now().strftime("%Y-%m-%d")
     pending = []
 
     # Собираем все URL у которых уже есть статус (не пустой и не дубль)
@@ -206,13 +206,6 @@ def mark_sent(row: int, new_sent_count: int, days_between: int = 3):
         logger.info(f"Строка {row}: все 20 сообщений отправлены, статус → done")
     else:
         sheet.update(values=[[str(new_sent_count), next_date]], range_name=f"C{row}:D{row}")
-    sheet.update_cell(row, COL_NEXT + 1, next_date)
-
-    # Если отправили 20 сообщений — помечаем done
-    if new_sent_count >= 20:
-        sheet.update_cell(row, COL_STATUS + 1, "done")
-        sheet.update_cell(row, COL_NEXT + 1, "—")
-        logger.info(f"Строка {row}: все 20 сообщений отправлены, статус → done")
 
 
 def mark_replied(offer_url: str, reply_text: str):
@@ -304,43 +297,45 @@ def _parse_collection_offer_ids(url: str) -> list[str]:
     import time
     from pathlib import Path
     from playwright.sync_api import sync_playwright
+    from cian_api import BROWSER_LOCK
 
     offer_ids = []
     session_file = os.getenv("CIAN_SESSION_FILE", "cian_session.json")
 
-    with sync_playwright() as p:
-        context = p.chromium.launch_persistent_context(
-            user_data_dir="cian_storage",
-            headless=True,
-            viewport={"width": 1280, "height": 900},
-            locale="ru-RU",
-            timezone_id="Europe/Moscow",
-            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            args=["--no-sandbox", "--disable-gpu", "--disable-blink-features=AutomationControlled"],
-            ignore_default_args=["--enable-automation"],
-        )
+    with BROWSER_LOCK:
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir="cian_storage",
+                headless=True,
+                viewport={"width": 1280, "height": 900},
+                locale="ru-RU",
+                timezone_id="Europe/Moscow",
+                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                args=["--no-sandbox", "--disable-gpu", "--disable-blink-features=AutomationControlled"],
+                ignore_default_args=["--enable-automation"],
+            )
 
-        if Path(session_file).exists():
-            with open(session_file) as f:
-                cookies = json.load(f)
-            valid = []
-            for c in cookies:
-                if c.get("sameSite") not in ("Strict", "Lax", "None"):
-                    c["sameSite"] = "Lax"
-                valid.append(c)
-            context.add_cookies(valid)
+            if Path(session_file).exists():
+                with open(session_file) as f:
+                    cookies = json.load(f)
+                valid = []
+                for c in cookies:
+                    if c.get("sameSite") not in ("Strict", "Lax", "None"):
+                        c["sameSite"] = "Lax"
+                    valid.append(c)
+                context.add_cookies(valid)
 
-        page = context.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        time.sleep(5)
+            page = context.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            time.sleep(5)
 
-        for _ in range(15):
-            page.evaluate("window.scrollBy(0, 800)")
-            time.sleep(0.5)
+            for _ in range(15):
+                page.evaluate("window.scrollBy(0, 800)")
+                time.sleep(0.5)
 
-        html = page.content()
-        offer_ids = list(dict.fromkeys(re.findall(r'"offerId":(\d+)', html)))
-        context.close()
+            html = page.content()
+            offer_ids = list(dict.fromkeys(re.findall(r'"offerId":(\d+)', html)))
+            context.close()
 
     return offer_ids
 
