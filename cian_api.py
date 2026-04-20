@@ -5,6 +5,7 @@
 import json
 import logging
 import os
+import threading
 from pathlib import Path
 
 import requests
@@ -16,6 +17,9 @@ API_BASE = "https://api.cian.ru/chats/v1"
 
 # Файл для трекинга уже уведомлённых чатов
 _NOTIFIED_FILE = Path("notified_chats.json")
+
+# Лок для Chromium-профиля — только один процесс за раз может открыть cian_storage
+BROWSER_LOCK = threading.Lock()
 
 
 def _load_notified() -> dict:
@@ -213,7 +217,8 @@ def check_replies() -> list[dict]:
 
     def _run_in_thread():
         try:
-            result_holder.extend(_check_replies_impl())
+            with BROWSER_LOCK:
+                result_holder.extend(_check_replies_impl())
         except Exception as e:
             error_holder.append(e)
 

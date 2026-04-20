@@ -21,6 +21,13 @@ def _get_config():
     return token, group_id
 
 
+def _get_proxies() -> dict | None:
+    proxy = os.getenv("SOCKS5_PROXY")
+    if proxy:
+        return {"http": f"socks5://{proxy}", "https": f"socks5://{proxy}"}
+    return None
+
+
 def _send_to_cian(offer_url: str, text: str) -> bool:
     import cian_api
     result = cian_api.send_message(offer_url, text)
@@ -133,6 +140,7 @@ def run_polling():
                 url,
                 params={"offset": offset, "timeout": 30},
                 timeout=35,
+                proxies=_get_proxies(),
             )
 
             if resp.status_code != 200:
