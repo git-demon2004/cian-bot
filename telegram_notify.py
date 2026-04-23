@@ -158,6 +158,43 @@ def notify_done(topic_id: int):
     )
 
 
+def notify_session_expiring(days_left: float):
+    """Предупреждение: cookie-сессия Циана скоро истечёт."""
+    rounded = max(0, int(round(days_left)))
+    send_to_general(
+        f"<b>⚠️ Сессия Циана скоро истечёт</b>\n\n"
+        f"Осталось примерно <b>{rounded} дн.</b> до истечения DMIR_AUTH.\n\n"
+        f"Бот пытается сам продлевать сессию (keepalive), но если это не сработает — "
+        f"нужно будет сделать релогин:\n"
+        f"<code>python login_cian.py</code>\n\n"
+        f"Лучше заложить это в план заранее."
+    )
+
+
+def notify_session_expired(reason: str = ""):
+    """Критический алерт: сессия Циана мертва, отправка остановлена."""
+    extra = f"\n\n<b>Причина:</b> {reason}" if reason else ""
+    send_to_general(
+        f"<b>🛑 Сессия Циана мертва</b>\n\n"
+        f"Отправка сообщений остановлена — API отвечает, что запрос "
+        f"не авторизован.{extra}\n\n"
+        f"Нужен релогин на сервере:\n"
+        f"<code>python login_cian.py</code>\n\n"
+        f"После этого бот сам продолжит работу — перезапуск не требуется."
+    )
+
+
+def notify_keepalive_result(success: bool, details: str = ""):
+    """Уведомление о результате keepalive (опционально, только при ошибке)."""
+    if success:
+        return
+    send_to_general(
+        f"<b>⚠️ Keepalive сессии Циана не сработал</b>\n\n"
+        f"{details}\n\n"
+        f"Если ситуация не исправится сама — проверь сессию и сделай релогин."
+    )
+
+
 def notify_daily_stats(stats: dict):
     """Ежедневная сводка в General."""
     text = (

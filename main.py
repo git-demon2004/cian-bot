@@ -21,8 +21,11 @@ load_dotenv()
 
 import sheets
 import cian_api
+import session_health
 import telegram_notify
 import telegram_bot
+
+SESSION_FILE = os.getenv("CIAN_SESSION_FILE", "cian_session.json")
 
 # Настройка логирования
 logging.basicConfig(
@@ -101,6 +104,13 @@ def task_send_messages():
             if topic_id:
                 telegram_notify.notify_send_result(topic_id, url, msg_index + 1, False, result["error"])
 
+            # Если протухла сессия — нет смысла дальше слать, все упадут
+            if result.get("auth_expired"):
+                logger.error("Сессия Циана протухла — прерываю рассылку")
+                if session_health.should_send_alert("auth_expired_runtime"):
+                    telegram_notify.notify_session_expired(result.get("error", ""))
+                break
+
         # Пауза между отправками — 30-90 секунд (антиспам)
         if pending.index(item) < len(pending) - 1:
             delay = random.randint(30, 90)
@@ -164,6 +174,71 @@ def task_process_collections():
         logger.error(f"Ошибка обработки подборок: {e}")
 
 
+def task_check_session_health():
+    """Задача: проверка срока жизни auth-cookie, алерт если осталось мало."""
+    status = session_health.read_session_status(SESSION_FILE)
+
+    if not status.cookie_found:
+        logger.warning("Auth-cookie DMIR_AUTH не найдена в session-файле")
+        if session_health.should_send_alert("auth_cookie_missing"):
+            telegram_notify.notify_session_expired(
+                "В cian_session.json нет cookie DMIR_AUTH — нужен релогин."
+            )
+        return
+
+    if status.is_expired:
+        logger.error(f"Cookie DMIR_AUTH истекла ({status.expires_at})")
+        if session_health.should_send_alert("auth_expired_scheduled"):
+            telegram_notify.notify_session_expired(
+                f"DMIR_AUTH истекла {status.expires_at:%Y-%m-%d %H:%M UTC}."
+            )
+        return
+
+    if status.needs_warning:
+        logger.warning(f"Сессия Циана истекает через {status.days_left:.1f} дн.")
+        # Алерты — не чаще раза в сутки, отдельный ключ на каждый «день остатка»
+        key = f"session_warn_{int(status.days_left)}"
+        if session_health.should_send_alert(key):
+            telegram_notify.notify_session_expiring(status.days_left)
+    else:
+        logger.info(
+            f"Сессия Циана жива: осталось ~{status.days_left:.1f} дн. "
+            f"до {status.expires_at:%Y-%m-%d %H:%M UTC}"
+        )
+
+
+def task_keepalive_session():
+    """Задача: keepalive — зайти на /dialogs/ и продлить DMIR_AUTH."""
+    logger.info("🔄 Keepalive: обновляю сессию Циана...")
+    try:
+        result = cian_api.refresh_session()
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"Keepalive упал с исключением: {e}")
+        if session_health.should_send_alert("keepalive_failed"):
+            telegram_notify.notify_keepalive_result(False, f"Исключение: {e}")
+        return
+
+    if result.get("success"):
+        logger.info(f"Keepalive OK: {result.get('cookies_count', 0)} cookies")
+        # После успешного keepalive сбрасываем флаги алертов — новый цикл
+        session_health.reset_alert("keepalive_failed")
+        session_health.reset_alert("auth_expired_runtime")
+        session_health.reset_alert("auth_expired_scheduled")
+        # Сразу перепроверим статус — вдруг порог warning ушёл дальше
+        task_check_session_health()
+        return
+
+    if result.get("auth_expired"):
+        logger.error("Keepalive: сессия мертва, нужен релогин")
+        if session_health.should_send_alert("auth_expired_keepalive"):
+            telegram_notify.notify_session_expired(result.get("error", ""))
+        return
+
+    logger.warning(f"Keepalive не удался: {result.get('error')}")
+    if session_health.should_send_alert("keepalive_failed"):
+        telegram_notify.notify_keepalive_result(False, result.get("error", ""))
+
+
 def task_daily_stats():
     """Задача: ежедневная сводка."""
     try:
@@ -179,7 +254,7 @@ def main():
     logger.info("=" * 50)
 
     # Проверяем наличие cookies
-    if not Path(os.getenv("CIAN_SESSION_FILE", "cian_session.json")).exists():
+    if not Path(SESSION_FILE).exists():
         logger.error("❌ Файл cian_session.json не найден! Сначала запусти: python login_cian.py")
         sys.exit(1)
 
@@ -189,9 +264,13 @@ def main():
         logger.error(f"❌ Файл {creds_file} не найден! Настрой Google Sheets API.")
         sys.exit(1)
 
+    # Стартовая проверка здоровья сессии — алертим сразу, а не ждём расписания
+    task_check_session_health()
+
     send_hour = int(os.getenv("SEND_HOUR", 12))
     send_minute = int(os.getenv("SEND_MINUTE", 0))
     check_interval = int(os.getenv("CHECK_REPLIES_INTERVAL_MINUTES", 60))
+    keepalive_days = int(os.getenv("KEEPALIVE_INTERVAL_DAYS", 7))
 
     scheduler = BackgroundScheduler(timezone="Europe/Moscow")
 
@@ -233,9 +312,29 @@ def main():
         name="Дневная сводка",
     )
 
+    # 5. Проверка здоровья сессии — каждый день в 11:55 (до отправки в 12:00)
+    scheduler.add_job(
+        task_check_session_health,
+        "cron",
+        hour=11,
+        minute=55,
+        id="session_health",
+        name="Проверка здоровья сессии",
+    )
+
+    # 6. Keepalive — раз в N дней, в 03:30 ночью (без конфликта с другими задачами)
+    scheduler.add_job(
+        task_keepalive_session,
+        "interval",
+        days=keepalive_days,
+        id="keepalive_session",
+        name="Keepalive сессии Циана",
+    )
+
     logger.info(f"📅 Отправка: каждый день в {send_hour}:{send_minute:02d} МСК")
     logger.info(f"📬 Проверка ответов: каждые {check_interval} мин")
     logger.info(f"📊 Сводка: каждый день в 20:00 МСК")
+    logger.info(f"🔄 Keepalive сессии: раз в {keepalive_days} дн.")
     logger.info("")
     logger.info("Жду расписания... (Ctrl+C для остановки)")
 
@@ -270,5 +369,11 @@ if __name__ == "__main__":
         task_check_replies()
     elif len(sys.argv) > 1 and sys.argv[1] == "--stats":
         task_daily_stats()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--health-check":
+        logger.info("🧪 Проверка здоровья сессии")
+        task_check_session_health()
+    elif len(sys.argv) > 1 and sys.argv[1] == "--keepalive":
+        logger.info("🧪 Ручной keepalive")
+        task_keepalive_session()
     else:
         main()
