@@ -6,9 +6,12 @@ import json
 import logging
 import os
 import threading
+import time
 from pathlib import Path
 
 import requests
+
+import session_health
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +124,13 @@ def send_message(offer_url: str, message_text: str) -> dict:
         logger.info(f"Сообщение отправлено через API: offerId={offer_id}")
         return result
 
+    # Auth-ошибка — сессия протухла
+    if session_health.is_auth_error(resp.status_code, resp.text):
+        result["auth_expired"] = True
+        result["error"] = f"Сессия Циана протухла ({resp.status_code}): {resp.text[:200]}"
+        logger.error(result["error"])
+        return result
+
     # Другие ошибки
     result["error"] = f"API ответил {resp.status_code}: {resp.text[:200]}"
     logger.error(result["error"])
@@ -152,7 +162,11 @@ def _send_first_via_hint(session: requests.Session, offer_id: int, message_text:
         return result
 
     if resp.status_code != 200:
-        result["error"] = f"Hint не прошёл: {resp.status_code} {resp.text[:200]}"
+        if session_health.is_auth_error(resp.status_code, resp.text):
+            result["auth_expired"] = True
+            result["error"] = f"Сессия Циана протухла ({resp.status_code}): {resp.text[:200]}"
+        else:
+            result["error"] = f"Hint не прошёл: {resp.status_code} {resp.text[:200]}"
         logger.error(result["error"])
         return result
 
@@ -199,6 +213,111 @@ def _get_browser_context():
         context.add_cookies(cookies)
 
     return p, context
+
+
+def refresh_session() -> dict:
+    """
+    Keepalive: открывает браузер с текущим профилем, заходит на /dialogs/,
+    даёт Cian'у обновить DMIR_AUTH и пере-экспортирует cookies в SESSION_FILE.
+
+    Работает в отдельном потоке + под BROWSER_LOCK, чтобы не конфликтовать
+    с check_replies и sync_playwright/asyncio.
+
+    Возвращает:
+        {"success": bool, "auth_expired": bool, "error": str|None,
+         "cookies_count": int}
+    """
+    result = {
+        "success": False,
+        "auth_expired": False,
+        "error": None,
+        "cookies_count": 0,
+    }
+
+    holder: dict = {}
+
+    def _run_in_thread():
+        try:
+            with BROWSER_LOCK:
+                holder.update(_refresh_session_impl())
+        except Exception as e:  # noqa: BLE001
+            holder["error"] = f"Исключение: {e}"
+
+    t = threading.Thread(target=_run_in_thread, daemon=True)
+    t.start()
+    t.join(timeout=120)
+
+    if t.is_alive():
+        result["error"] = "Keepalive: таймаут 120 сек"
+        logger.error(result["error"])
+        return result
+
+    result.update(holder)
+    return result
+
+
+def _refresh_session_impl() -> dict:
+    """Внутренняя реализация keepalive (выполняется в отдельном потоке)."""
+    out = {
+        "success": False,
+        "auth_expired": False,
+        "error": None,
+        "cookies_count": 0,
+    }
+
+    try:
+        p, context = _get_browser_context()
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"Не удалось запустить браузер: {e}"
+        logger.error(out["error"])
+        return out
+
+    try:
+        page = context.new_page()
+        page.goto(
+            "https://www.cian.ru/dialogs/",
+            wait_until="domcontentloaded",
+            timeout=30000,
+        )
+        # Дадим JS отработать и серверу обновить DMIR_AUTH
+        time.sleep(8)
+
+        current_url = page.url or ""
+        # Если Циан редиректнул на authenticate — значит сессия мертва,
+        # keepalive не помогает, нужен ручной релогин
+        if "authenticate" in current_url or "login" in current_url:
+            out["auth_expired"] = True
+            out["error"] = f"Редирект на логин: {current_url}"
+            logger.error(out["error"])
+            return out
+
+        cookies = context.cookies()
+        if not cookies:
+            out["error"] = "Cookies пустые после keepalive"
+            logger.error(out["error"])
+            return out
+
+        # Пере-экспортируем — оставляем тот же формат, что login_cian.py
+        Path(SESSION_FILE).write_text(
+            json.dumps(cookies, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        out["success"] = True
+        out["cookies_count"] = len(cookies)
+        logger.info(f"Keepalive: обновлено {len(cookies)} cookies")
+        return out
+
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"Ошибка keepalive: {e}"
+        logger.error(out["error"])
+        return out
+
+    finally:
+        try:
+            context.close()
+            p.stop()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def check_replies() -> list[dict]:
