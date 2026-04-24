@@ -27,23 +27,43 @@ def _get_proxies() -> dict | None:
 
 
 def _api(method: str, **params) -> dict | None:
-    """Вызов Telegram Bot API."""
+    """Вызов Telegram Bot API с retry при transient network errors.
+
+    Первый sendMessage после старта процесса часто таймаутится на холодном
+    TLS handshake к api.telegram.org. Retry со свежим соединением проходит
+    за <1 сек. Поэтому timeout=30 (вместо 15) и один повтор.
+    """
     token, _ = _get_config()
     if not token:
         logger.warning("TELEGRAM_BOT_TOKEN не задан")
         return None
 
     url = f"https://api.telegram.org/bot{token}/{method}"
-    try:
-        resp = requests.post(url, json=params, timeout=15, proxies=_get_proxies())
-        data = resp.json()
-        if not data.get("ok"):
-            logger.error(f"Telegram API {method}: {data}")
+    last_error: Exception | None = None
+
+    for attempt in (1, 2):
+        try:
+            resp = requests.post(url, json=params, timeout=30, proxies=_get_proxies())
+            data = resp.json()
+            if not data.get("ok"):
+                logger.error(f"Telegram API {method}: {data}")
+                return None
+            return data.get("result")
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt == 1:
+                logger.warning(f"Telegram API {method} attempt 1 failed ({type(e).__name__}), retrying...")
+                continue
+            logger.error(f"Telegram API {method}: {e}")
             return None
-        return data.get("result")
-    except Exception as e:
-        logger.error(f"Telegram API {method}: {e}")
-        return None
+        except Exception as e:
+            logger.error(f"Telegram API {method}: {e}")
+            return None
+
+    # Недостижимо, но для полноты — last_error может пригодиться в логах.
+    if last_error:
+        logger.error(f"Telegram API {method} fell through after retry: {last_error}")
+    return None
 
 
 def _extract_offer_id(url: str) -> str:
