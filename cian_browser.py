@@ -282,6 +282,7 @@ def send_message(offer_url: str, message_text: str) -> dict:
 
             login_btn = page.query_selector('text=Войти')
             if login_btn and login_btn.is_visible():
+                result["auth_expired"] = True
                 result["error"] = "Не залогинены в Циан. Запусти login_cian.py"
                 logger.error(result["error"])
                 return result
