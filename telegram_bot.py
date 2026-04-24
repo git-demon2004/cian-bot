@@ -10,6 +10,7 @@ import os
 import threading
 from datetime import datetime
 
+import net_ipv4  # noqa: F401 — форсит IPv4 для requests/urllib3
 import requests
 
 logger = logging.getLogger(__name__)

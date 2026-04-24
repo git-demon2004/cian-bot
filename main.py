@@ -21,11 +21,17 @@ load_dotenv()
 
 import sheets
 import cian_api
+import cian_browser
 import session_health
 import telegram_notify
 import telegram_bot
 
 SESSION_FILE = os.getenv("CIAN_SESSION_FILE", "cian_session.json")
+
+# SEND_VIA=browser — отправка через Playwright (надёжнее при усилении анти-бота Циана)
+# SEND_VIA=api     — отправка через HTTP API (быстрее, но требует стабильного API)
+_SEND_VIA = os.getenv("SEND_VIA", "browser").strip().lower()
+_send_impl = cian_browser if _SEND_VIA == "browser" else cian_api
 
 # Настройка логирования
 logging.basicConfig(
@@ -88,8 +94,8 @@ def task_send_messages():
 
         logger.info(f"Отправляю сообщение #{msg_index + 1} → {url}")
 
-        # Отправляем через API
-        result = cian_api.send_message(url, msg_text)
+        # Отправляем через выбранный транспорт (см. SEND_VIA в .env)
+        result = _send_impl.send_message(url, msg_text)
 
         topic_id = item.get("topic_id")
 
@@ -331,7 +337,7 @@ def main():
         name="Keepalive сессии Циана",
     )
 
-    logger.info(f"📅 Отправка: каждый день в {send_hour}:{send_minute:02d} МСК")
+    logger.info(f"📅 Отправка: каждый день в {send_hour}:{send_minute:02d} МСК (через {_SEND_VIA})")
     logger.info(f"📬 Проверка ответов: каждые {check_interval} мин")
     logger.info(f"📊 Сводка: каждый день в 20:00 МСК")
     logger.info(f"🔄 Keepalive сессии: раз в {keepalive_days} дн.")
