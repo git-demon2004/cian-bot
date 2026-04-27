@@ -249,6 +249,21 @@ def _extract_offer_id(offer_url: str) -> str:
     return match.group(1) if match else ""
 
 
+def _type_message_with_newlines(textarea, message_text: str) -> None:
+    """Печатает текст в textarea с человеческой скоростью.
+
+    В чате Циана голый Enter отправляет сообщение, поэтому переносы строк
+    вставляем через Shift+Enter — это добавляет литеральный \\n в поле
+    без отправки. Финальный Enter (отправку) делает вызывающий код.
+    """
+    lines = message_text.split("\n")
+    for line_idx, line in enumerate(lines):
+        if line_idx > 0:
+            textarea.press("Shift+Enter")
+        for char in line:
+            textarea.type(char, delay=random.randint(30, 80))
+
+
 def send_message(offer_url: str, message_text: str) -> dict:
     """
     Отправляет сообщение собственнику по ссылке на объявление.
@@ -329,16 +344,16 @@ def send_message(offer_url: str, message_text: str) -> dict:
                 page.screenshot(path=f"debug_no_textarea_{int(time.time())}.png")
                 return result
 
-            # 4. Вводим текст с человеческой скоростью
+            # 4. Вводим текст. См. _type_message_with_newlines: \n → Shift+Enter,
+            # чтобы перенос строки не сработал как отправка.
             textarea.click()
             _human_delay(0.5, 1.0)
 
-            for char in message_text:
-                textarea.type(char, delay=random.randint(30, 80))
+            _type_message_with_newlines(textarea, message_text)
 
             _human_delay(1, 2)
 
-            # 5. Отправляем Enter
+            # 5. Финальный Enter — отправка целого сообщения одним блоком
             textarea.press("Enter")
             _human_delay(3, 5)
 
