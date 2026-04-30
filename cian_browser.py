@@ -22,9 +22,87 @@ def _human_delay(min_sec=1.0, max_sec=3.0):
     time.sleep(random.uniform(min_sec, max_sec))
 
 
+def _cleanup_stale_singleton_locks() -> None:
+    """
+    Aggressive cleanup перед launch_persistent_context.
+
+    На этом VPS только cian-bot пользуется data_dir cian_storage. BROWSER_LOCK
+    в cian_api.BROWSER_LOCK гарантирует что внутри нашего Python-процесса
+    единовременно только один поток держит chromium. Поэтому ЛЮБОЙ найденный
+    chromium с нашей user_data_dir = осиротевший от прежнего креша/SIGKILL/
+    upstream-падения, блокирующий новый launch с TargetClosedError "Opening
+    in existing browser session".
+
+    Логика:
+      1. pgrep на user-data-dir=cian_storage
+      2. Если есть PID-ы — SIGTERM, ждём 3 сек, SIGKILL
+      3. Удаляем SingletonLock/SingletonCookie/SingletonSocket
+      4. Доп. удаляем .org.chromium.* (мусор от прерванной сессии)
+
+    Раньше функция пропускала cleanup при pgrep-match и Browser-collision
+    (item #16) проявлялся как 0/60 sent на cron 12:00 МСК 2026-04-30.
+    """
+    import signal
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", f"user-data-dir={SESSION_DIR}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pids = [int(x) for x in result.stdout.split() if x.strip().isdigit()]
+    except Exception as e:
+        logger.warning(f"_cleanup: pgrep error {e}, продолжаем")
+        pids = []
+
+    if pids:
+        logger.warning(
+            f"⚠️  CHROMIUM_ORPHAN_DETECTED: найдено {len(pids)} chromium-процесса "
+            f"на {SESSION_DIR} (PIDs: {pids}) — убиваю перед launch"
+        )
+        # SIGTERM первым шагом
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        time.sleep(3)
+        # SIGKILL для тех что выжили
+        for pid in pids:
+            try:
+                os.kill(pid, 0)  # check alive
+                os.kill(pid, signal.SIGKILL)
+                logger.warning(f"  SIGKILL для PID {pid}")
+            except (ProcessLookupError, PermissionError):
+                pass
+        time.sleep(1)
+
+    # Удаляем lock-файлы (могут остаться даже после KILL)
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        try:
+            (SESSION_DIR / name).unlink(missing_ok=True)
+        except Exception:
+            pass
+    # Дополнительный мусор от прерванных сессий
+    try:
+        for p in SESSION_DIR.glob(".org.chromium.*"):
+            try:
+                p.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if pids:
+        logger.info(f"✅ Cleanup завершён, готов к launch_persistent_context")
+
+
 def _get_browser_context(playwright) -> BrowserContext:
-    """Создаёт browser context с сохранённой сессией и антидетектом."""
-    context = playwright.chromium.launch_persistent_context(
+    """
+    Создаёт browser context с сохранённой сессией и антидетектом.
+
+    Retry-логика: если launch_persistent_context падает (TargetClosedError
+    обычно от orphan chromium), делает второй проход cleanup + повтор.
+    """
+    launch_args = dict(
         user_data_dir=str(SESSION_DIR),
         headless=False,
         viewport={"width": 1280, "height": 800},
@@ -44,14 +122,29 @@ def _get_browser_context(playwright) -> BrowserContext:
         ignore_default_args=["--enable-automation"],
     )
 
-    # Применяем stealth к контексту
+    last_err = None
+    for attempt in range(2):
+        _cleanup_stale_singleton_locks()
+        try:
+            context = playwright.chromium.launch_persistent_context(**launch_args)
+            break
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                f"launch_persistent_context (cian_browser) attempt {attempt + 1}/2 failed: {e}"
+            )
+            time.sleep(2)
+    else:
+        raise RuntimeError(
+            f"_get_browser_context: launch failed after 2 attempts: {last_err}"
+        )
+
     stealth = Stealth(
         navigator_languages_override=("ru-RU", "ru"),
         navigator_platform_override="Linux x86_64",
     )
     stealth.apply_stealth_sync(context)
 
-    # Подгружаем cookies из файла если есть (бэкап)
     if Path(SESSION_FILE).exists():
         try:
             with open(SESSION_FILE) as f:
@@ -103,40 +196,56 @@ def _solve_captcha_2captcha(page: Page) -> bool:
         from twocaptcha import TwoCaptcha
         solver = TwoCaptcha(api_key)
 
-        # Извлекаем sitekey из страницы
-        sitekey = page.evaluate('''() => {
-            // Ищем sitekey в атрибутах или скриптах
+        # Извлекаем sitekey из страницы — с retry, т.к. iframe SmartCaptcha
+        # может рендериться с задержкой после первоначального _has_captcha=True.
+        sitekey_js = '''() => {
             const el = document.querySelector('[data-sitekey]');
             if (el) return el.getAttribute('data-sitekey');
-            // Ищем в iframe src
-            const iframe = document.querySelector('iframe[src*="smartcaptcha"]');
+            const iframe = document.querySelector('iframe[src*="smartcaptcha"], iframe[src*="captcha"]');
             if (iframe) {
-                const url = new URL(iframe.src);
-                return url.searchParams.get('sitekey') || '';
+                try {
+                    const url = new URL(iframe.src);
+                    return url.searchParams.get('sitekey') || '';
+                } catch(e) {}
             }
-            // Ищем в скриптах
             const scripts = document.querySelectorAll('script');
             for (const s of scripts) {
                 const match = s.textContent?.match(/sitekey['"\\s:]+['"]([^'"]+)['"]/);
                 if (match) return match[1];
             }
             return '';
-        }''')
+        }'''
+
+        sitekey = page.evaluate(sitekey_js)
+        if not sitekey:
+            logger.warning("⚠️  CAPTCHA_SITEKEY_RETRY: sitekey не найден сразу, жду до 5с")
+            for retry in range(5):
+                time.sleep(1)
+                sitekey = page.evaluate(sitekey_js)
+                if sitekey:
+                    logger.info(f"sitekey найден после retry {retry + 1}")
+                    break
 
         if not sitekey:
-            # Для SmartCaptcha — используем sitekey по умолчанию
-            # или пробуем извлечь из URL
-            logger.warning("sitekey не найден, пробую стандартный подход")
-            # Делаем скриншот и отправляем как обычную капчу
-            page.screenshot(path="captcha_screenshot.png")
-            result = solver.normal("captcha_screenshot.png")
-            logger.info(f"2captcha решил капчу (normal): {result['code'][:20]}...")
-            return True
+            # КРИТИЧНО: solver.normal() для interactive Yandex SmartCaptcha
+            # НЕ РАБОТАЕТ — image OCR не может пройти behavioral check.
+            # Раньше тут был silent false-success → клиент получал
+            # out-of-context сообщение (incident 2026-04-30, offerId 328356333).
+            # Возвращаем False — пусть post-Enter verification заблокирует send.
+            logger.error("⚠️  CAPTCHA_NO_SITEKEY: sitekey не найден за 5с — fail (отправка будет заблокирована)")
+            try:
+                page.screenshot(path=f"debug_no_sitekey_{int(time.time())}.png", timeout=5000)
+            except Exception:
+                pass
+            return False
 
         logger.info(f"Решаю SmartCaptcha через 2captcha (sitekey: {sitekey[:20]}...)")
-        result = solver.yandex(
+        # twocaptcha-python 1.5.0+ не имеет метода .yandex(), используем
+        # generic .solve(method="yandex", ...). Параметр URL — pageurl.
+        result = solver.solve(
+            method="yandex",
             sitekey=sitekey,
-            url=page.url,
+            pageurl=page.url,
         )
         token = result["code"]
         logger.info(f"2captcha решил капчу, токен: {token[:30]}...")
@@ -168,9 +277,14 @@ def _handle_captcha(page: Page) -> bool:
     Обнаруживает и пробует пройти капчу Yandex SmartCaptcha.
     Сначала пробует кликнуть (бесплатно), потом 2captcha (платно).
     Возвращает True если капча пройдена или её не было.
+
+    Telemetry-маркеры (для grep): CAPTCHA_ENCOUNTERED, CAPTCHA_SOLVED_CLICK,
+    CAPTCHA_SOLVED_2CAPTCHA, CAPTCHA_FAILED, CAPTCHA_NO_SITEKEY.
     """
     if not _has_captcha(page):
         return True
+
+    logger.warning(f"⚠️  CAPTCHA_ENCOUNTERED: url={page.url[:80]}")
 
     # Попытка 1: клик по чекбоксу (бесплатно)
     for attempt in range(2):
@@ -182,7 +296,7 @@ def _handle_captcha(page: Page) -> bool:
                 captcha_el.click()
                 _human_delay(4, 6)
                 if not _has_captcha(page):
-                    logger.info("Капча пройдена кликом")
+                    logger.info("✅ CAPTCHA_SOLVED_CLICK: пройдена кликом по 'Я не робот'")
                     return True
 
             for frame in page.frames:
@@ -193,7 +307,7 @@ def _handle_captcha(page: Page) -> bool:
                         checkbox.click()
                         _human_delay(4, 6)
                         if not _has_captcha(page):
-                            logger.info("Капча пройдена через iframe checkbox")
+                            logger.info("✅ CAPTCHA_SOLVED_CLICK: пройдена iframe checkbox")
                             return True
                 except:
                     continue
@@ -202,7 +316,7 @@ def _handle_captcha(page: Page) -> bool:
             page.reload(wait_until="domcontentloaded", timeout=20000)
             _human_delay(3, 5)
             if not _has_captcha(page):
-                logger.info("Капча исчезла после перезагрузки")
+                logger.info("✅ CAPTCHA_SOLVED_CLICK: исчезла после перезагрузки")
                 return True
 
         except Exception as e:
@@ -212,10 +326,14 @@ def _handle_captcha(page: Page) -> bool:
     if os.getenv("TWOCAPTCHA_API_KEY"):
         logger.info("Кликом не прошла, отправляю в 2captcha")
         if _solve_captcha_2captcha(page):
+            logger.info("✅ CAPTCHA_SOLVED_2CAPTCHA: пройдена через сервис")
             return True
 
-    logger.error("Не удалось пройти капчу")
-    page.screenshot(path=f"debug_captcha_{int(time.time())}.png")
+    logger.error("❌ CAPTCHA_FAILED: не удалось пройти капчу (ни кликом, ни через 2captcha)")
+    try:
+        page.screenshot(path=f"debug_captcha_{int(time.time())}.png", timeout=5000)
+    except Exception:
+        pass
     return False
 
 
@@ -247,6 +365,21 @@ def _extract_offer_id(offer_url: str) -> str:
     import re
     match = re.search(r'/(?:sale|rent)/[\w-]+/(\d+)', offer_url)
     return match.group(1) if match else ""
+
+
+def _type_message_with_newlines(textarea, message_text: str) -> None:
+    """Печатает текст в textarea с человеческой скоростью.
+
+    В чате Циана голый Enter отправляет сообщение, поэтому переносы строк
+    вставляем через Shift+Enter — это добавляет литеральный \\n в поле
+    без отправки. Финальный Enter (отправку) делает вызывающий код.
+    """
+    lines = message_text.split("\n")
+    for line_idx, line in enumerate(lines):
+        if line_idx > 0:
+            textarea.press("Shift+Enter")
+        for char in line:
+            textarea.type(char, delay=random.randint(30, 80))
 
 
 def send_message(offer_url: str, message_text: str) -> dict:
@@ -329,26 +462,73 @@ def send_message(offer_url: str, message_text: str) -> dict:
                 page.screenshot(path=f"debug_no_textarea_{int(time.time())}.png")
                 return result
 
-            # 4. Вводим текст с человеческой скоростью
+            # 4. Вводим текст. См. _type_message_with_newlines: \n → Shift+Enter,
+            # чтобы перенос строки не сработал как отправка.
             textarea.click()
             _human_delay(0.5, 1.0)
 
-            for char in message_text:
-                textarea.type(char, delay=random.randint(30, 80))
+            _type_message_with_newlines(textarea, message_text)
 
             _human_delay(1, 2)
 
-            # 5. Отправляем Enter
+            # 5. Финальный Enter — отправка целого сообщения одним блоком
             textarea.press("Enter")
             _human_delay(3, 5)
 
-            # 6. Проверяем что сообщение появилось в чате
+            # 6. Post-submit verification — убеждаемся что отправка реально
+            # произошла, а не была проглочена капчей или anti-bot. Несколько
+            # независимых сигналов:
+            verify_ok = True
+            verify_reason = ""
+
+            # 6a. Если после Enter снова появилась капча → submit перехвачен
+            try:
+                if _has_captcha(page):
+                    verify_ok = False
+                    verify_reason = "после Enter появилась капча"
+            except Exception as e:
+                logger.warning(f"verify captcha check err: {e}")
+
+            # 6b. textarea должен очиститься после успешного submit
+            if verify_ok:
+                try:
+                    ta_value = textarea.input_value() if textarea else ""
+                    if ta_value and ta_value.strip():
+                        verify_ok = False
+                        verify_reason = f"textarea не очистился (осталось {len(ta_value)} символов)"
+                except Exception as e:
+                    logger.warning(f"verify textarea check err: {e}")
+
+            # 6c. Текст нашего сообщения должен появиться в DOM
+            # (приходящее сообщение рендерится как пузырь)
+            if verify_ok:
+                first_line = (message_text.split("\n", 1)[0] or "").strip()
+                if first_line:
+                    probe = first_line[:60]
+                    try:
+                        found = page.evaluate(
+                            "(text) => Array.from(document.querySelectorAll('div, span, p')).some(el => (el.innerText || '').includes(text))",
+                            probe,
+                        )
+                        if not found:
+                            verify_ok = False
+                            verify_reason = "текст сообщения не найден в DOM после Enter"
+                    except Exception as e:
+                        logger.warning(f"verify DOM-text check err: {e}")
+
+            # 7. Скриншот для архива (полезно при разборе fail-кейсов)
             try:
                 page.screenshot(path=f"debug_sent_{offer_id}.png", timeout=10000)
             except Exception:
-                pass  # Скриншот не критичен
-            result["success"] = True
-            logger.info(f"Сообщение отправлено: offerId={offer_id}")
+                pass
+
+            if verify_ok:
+                result["success"] = True
+                logger.info(f"Сообщение отправлено: offerId={offer_id}")
+            else:
+                result["success"] = False
+                result["error"] = f"submit_verification_failed: {verify_reason}"
+                logger.error(f"⚠️  Отправка НЕ подтверждена: offerId={offer_id} — {verify_reason}")
 
         except Exception as e:
             result["error"] = str(e)

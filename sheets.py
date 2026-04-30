@@ -196,20 +196,97 @@ def get_pending_sends(days_between: int = 3) -> list[dict]:
     return pending
 
 
+def _gspread_update_with_retry(sheet, values, range_name, label: str = "", max_attempts: int = 3):
+    """
+    Выполняет sheet.update() с retry и backoff. Поднимает последнее исключение
+    после исчерпания попыток. Логирует каждую неудачу.
+
+    Без retry: транзиентная ошибка gspread (5xx, network) во время mark_sent
+    оставит sent_count в Sheet старым → следующий cron отправит ТОТ ЖЕ шаблон
+    повторно → клиент получит дубликат.
+    """
+    import time as _time
+    last_err = None
+    for attempt in range(max_attempts):
+        try:
+            sheet.update(values=values, range_name=range_name)
+            return
+        except Exception as e:
+            last_err = e
+            backoff = 2 ** attempt
+            logger.warning(
+                f"⚠️  GSPREAD_RETRY {label} attempt {attempt + 1}/{max_attempts} "
+                f"range={range_name} err={e} backoff={backoff}s"
+            )
+            _time.sleep(backoff)
+    logger.error(
+        f"❌ GSPREAD_FAIL {label} range={range_name} values={values} — "
+        f"исчерпаны попытки, last_err={last_err}"
+    )
+    raise last_err
+
+
 def mark_sent(row: int, new_sent_count: int, days_between: int = 3):
-    """Отмечает успешную отправку — один batch-запрос."""
+    """
+    Отмечает успешную отправку — один batch-запрос.
+
+    Retry на gspread errors (3 попытки с exponential backoff). Если все попытки
+    провалились — поднимает исключение наверх + Telegram alert. Caller'ы должны
+    учитывать что mark_sent может бросить даже если отправка прошла успешно.
+    """
     sheet = _get_sheet()
     next_date = (datetime.now() + timedelta(days=days_between)).strftime("%Y-%m-%d")
 
     if new_sent_count >= 20:
-        sheet.update(values=[[str(new_sent_count), "—", "done"]], range_name=f"C{row}:E{row}")
-        logger.info(f"Строка {row}: все 20 сообщений отправлены, статус → done")
+        try:
+            _gspread_update_with_retry(
+                sheet,
+                values=[[str(new_sent_count), "—", "done"]],
+                range_name=f"C{row}:E{row}",
+                label=f"mark_sent(done) row={row}",
+            )
+            logger.info(f"Строка {row}: все 20 сообщений отправлены, статус → done")
+        except Exception as e:
+            _emit_critical_alert(
+                f"❌ mark_sent FAIL row={row}: отправка #{new_sent_count} прошла на Циан, "
+                f"но Sheets не обновлён. РУЧНОЕ ДЕЙСТВИЕ: установить C{row}={new_sent_count}, "
+                f"D{row}=—, E{row}=done. Иначе цикл отправки пойдёт повторно. err={e}"
+            )
+            raise
     else:
-        sheet.update(values=[[str(new_sent_count), next_date]], range_name=f"C{row}:D{row}")
+        try:
+            _gspread_update_with_retry(
+                sheet,
+                values=[[str(new_sent_count), next_date]],
+                range_name=f"C{row}:D{row}",
+                label=f"mark_sent row={row}",
+            )
+        except Exception as e:
+            _emit_critical_alert(
+                f"❌ mark_sent FAIL row={row}: отправка #{new_sent_count} прошла на Циан, "
+                f"но Sheets не обновлён → завтрашний cron повторит ТО ЖЕ сообщение. "
+                f"РУЧНОЕ ДЕЙСТВИЕ: установить C{row}={new_sent_count}, D{row}={next_date}. err={e}"
+            )
+            raise
+
+
+def _emit_critical_alert(msg: str):
+    """Отправляет alert в Telegram General + лог. Тихо игнорирует ошибки самого alert."""
+    logger.error(msg)
+    try:
+        import telegram_notify
+        telegram_notify.send_to_general(msg[:3500])
+    except Exception as e:
+        logger.error(f"_emit_critical_alert: тоже не смог отправить TG alert: {e}")
 
 
 def mark_replied(offer_url: str, reply_text: str):
-    """Ставит статус 'replied' для объявления."""
+    """
+    Ставит статус 'replied' для объявления. Retry на gspread errors.
+
+    Если mark_replied падает: бот продолжит слать шаблоны клиенту, который
+    уже ответил → spam. Поэтому retry + critical alert.
+    """
     sheet = _get_sheet()
     all_rows = sheet.get_all_values()
 
@@ -221,9 +298,22 @@ def mark_replied(offer_url: str, reply_text: str):
         # Сравниваем URL (может быть с/без www, с/без слеша)
         if _urls_match(url, offer_url):
             row_num = i + 1
-            sheet.update(values=[["replied", "—", reply_text[:100]]], range_name=f"E{row_num}:G{row_num}")
-            logger.info(f"Строка {row_num}: собственник ответил, статус → replied")
-            return True
+            try:
+                _gspread_update_with_retry(
+                    sheet,
+                    values=[["replied", "—", reply_text[:100]]],
+                    range_name=f"E{row_num}:G{row_num}",
+                    label=f"mark_replied row={row_num}",
+                )
+                logger.info(f"Строка {row_num}: собственник ответил, статус → replied")
+                return True
+            except Exception as e:
+                _emit_critical_alert(
+                    f"❌ mark_replied FAIL row={row_num} url={offer_url}: собственник ответил, "
+                    f"но Sheets не обновлён → бот продолжит слать ему шаблоны. "
+                    f"РУЧНОЕ ДЕЙСТВИЕ: установить E{row_num}=replied. err={e}"
+                )
+                return False
 
     logger.warning(f"URL не найден в таблице: {offer_url}")
     return False
@@ -290,6 +380,62 @@ def get_stats() -> dict:
     return stats
 
 
+def _aggressive_chromium_cleanup(storage: "Path") -> None:
+    """
+    Aggressive cleanup перед launch_persistent_context (sheets).
+
+    BROWSER_LOCK гарантирует что в нашем процессе только один поток держит
+    chromium → любой найденный chromium с user_data_dir=cian_storage
+    = осиротевший. SIGTERM → 3s → SIGKILL → unlink locks.
+    """
+    import os
+    import signal
+    import subprocess
+    import time
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", f"user-data-dir={storage}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pids = [int(x) for x in result.stdout.split() if x.strip().isdigit()]
+    except Exception as e:
+        logger.warning(f"_aggressive_chromium_cleanup: pgrep err {e}")
+        pids = []
+
+    if pids:
+        logger.warning(
+            f"⚠️  CHROMIUM_ORPHAN_DETECTED (sheets): {len(pids)} процесса "
+            f"(PIDs: {pids}) — kill"
+        )
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        time.sleep(3)
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        time.sleep(1)
+
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        try:
+            (storage / name).unlink(missing_ok=True)
+        except Exception:
+            pass
+    try:
+        for p in storage.glob(".org.chromium.*"):
+            try:
+                p.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _parse_collection_offer_ids(url: str) -> list[str]:
     """Парсит подборку Циан и возвращает список offerIds через браузер."""
     import json
@@ -301,41 +447,65 @@ def _parse_collection_offer_ids(url: str) -> list[str]:
 
     offer_ids = []
     session_file = os.getenv("CIAN_SESSION_FILE", "cian_session.json")
+    storage = Path("cian_storage")
+
+    launch_args = dict(
+        user_data_dir="cian_storage",
+        headless=True,
+        viewport={"width": 1280, "height": 900},
+        locale="ru-RU",
+        timezone_id="Europe/Moscow",
+        user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        args=["--no-sandbox", "--disable-gpu", "--disable-blink-features=AutomationControlled"],
+        ignore_default_args=["--enable-automation"],
+    )
 
     with BROWSER_LOCK:
         with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir="cian_storage",
-                headless=True,
-                viewport={"width": 1280, "height": 900},
-                locale="ru-RU",
-                timezone_id="Europe/Moscow",
-                user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                args=["--no-sandbox", "--disable-gpu", "--disable-blink-features=AutomationControlled"],
-                ignore_default_args=["--enable-automation"],
-            )
+            # Retry-launch с двойным cleanup
+            context = None
+            last_err = None
+            for attempt in range(2):
+                _aggressive_chromium_cleanup(storage)
+                try:
+                    context = p.chromium.launch_persistent_context(**launch_args)
+                    break
+                except Exception as e:
+                    last_err = e
+                    logger.warning(
+                        f"launch_persistent_context (sheets) attempt {attempt + 1}/2 failed: {e}"
+                    )
+                    time.sleep(2)
+            if context is None:
+                logger.error(f"_parse_collection_offer_ids: launch failed: {last_err}")
+                return []
 
-            if Path(session_file).exists():
-                with open(session_file) as f:
-                    cookies = json.load(f)
-                valid = []
-                for c in cookies:
-                    if c.get("sameSite") not in ("Strict", "Lax", "None"):
-                        c["sameSite"] = "Lax"
-                    valid.append(c)
-                context.add_cookies(valid)
+            try:
+                if Path(session_file).exists():
+                    with open(session_file) as f:
+                        cookies = json.load(f)
+                    valid = []
+                    for c in cookies:
+                        if c.get("sameSite") not in ("Strict", "Lax", "None"):
+                            c["sameSite"] = "Lax"
+                        valid.append(c)
+                    context.add_cookies(valid)
 
-            page = context.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            time.sleep(5)
+                page = context.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=60000)
+                time.sleep(5)
 
-            for _ in range(15):
-                page.evaluate("window.scrollBy(0, 800)")
-                time.sleep(0.5)
+                for _ in range(15):
+                    page.evaluate("window.scrollBy(0, 800)")
+                    time.sleep(0.5)
 
-            html = page.content()
-            offer_ids = list(dict.fromkeys(re.findall(r'"offerId":(\d+)', html)))
-            context.close()
+                html = page.content()
+                offer_ids = list(dict.fromkeys(re.findall(r'"offerId":(\d+)', html)))
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
 
     return offer_ids
 
@@ -423,3 +593,160 @@ def process_collections():
             logger.error(f"Ошибка парсинга подборки {col_url}: {e}")
             col_sheet.update_cell(i, 2, "ошибка")
             col_sheet.update_cell(i, 4, str(e)[:50])
+
+
+def ensure_topics(pause_sec: float = 5.0, max_per_run: int = 30) -> dict:
+    """
+    Сканирует Рассылку, для active-строк без topic_id создаёт Telegram-topic
+    и записывает его в колонку G. Лечит исторический баг:
+    `create_topic` мог вернуть None из-за transient ошибки _api (TLS / 429 /
+    timeout), а `get_pending_sends` инициализирует строку только один раз
+    (status=active) и больше не пытается. Без этой функции topic_id остаётся
+    пустым навсегда — уведомления в группу пропадают.
+
+    Запускать периодически (например в `task_process_collections`).
+    `pause_sec` — пауза между топиками (антиспам и rate-limit Telegram).
+    `max_per_run` — лимит за один прогон, чтобы при большом backlog не
+    разрывать телефон.
+
+    Возвращает: {"scanned": N, "created": N, "failed": N, "skipped_quota": N}.
+    """
+    import time as _time
+    import telegram_notify
+
+    sheet = _get_sheet()
+    all_rows = sheet.get_all_values()
+
+    targets = []
+    for i, row in enumerate(all_rows):
+        if i == 0:
+            continue
+        url = row[COL_URL].strip() if len(row) > COL_URL else ""
+        if not url.startswith("http"):
+            continue
+        status = row[COL_STATUS].strip().lower() if len(row) > COL_STATUS else ""
+        if status != "active":
+            continue
+        topic = row[COL_TOPIC].strip() if len(row) > COL_TOPIC else ""
+        if topic.isdigit():
+            continue
+        targets.append((i + 1, url))
+
+    scanned = len(targets)
+    if scanned == 0:
+        logger.info("ensure_topics: пропусков нет")
+        return {"scanned": 0, "created": 0, "failed": 0, "skipped_quota": 0}
+
+    quota = min(scanned, max_per_run)
+    skipped_quota = scanned - quota
+    created = 0
+    failed = 0
+
+    logger.info(
+        f"ensure_topics: найдено {scanned} active-строк без topic_id, "
+        f"обрабатываю {quota} за этот прогон"
+    )
+
+    for row_num, url in targets[:quota]:
+        topic_id = telegram_notify.create_topic(url)
+        if topic_id:
+            sheet.update(values=[[str(topic_id)]], range_name=f"G{row_num}")
+            created += 1
+            logger.info(f"ensure_topics: row={row_num} topic_id={topic_id}")
+        else:
+            failed += 1
+            logger.warning(f"ensure_topics: row={row_num} create_topic вернул None — повторим следующим прогоном")
+        _time.sleep(pause_sec)
+
+    logger.info(
+        f"ensure_topics итог: создано {created}, не удалось {failed}, "
+        f"отложено квотой {skipped_quota}"
+    )
+    return {"scanned": scanned, "created": created, "failed": failed, "skipped_quota": skipped_quota}
+
+
+def promote_base_to_rassylka(dry_run: bool = False) -> dict:
+    """
+    Переносит URL из листа База в лист Рассылка (только колонка A).
+
+    Дедуп против Рассылки и Стоп-листа. После переноса get_pending_sends()
+    при следующем запуске сам инициализирует строки:
+    B=today, C=0, D=today, E=active — и они попадают в очередь отправки.
+
+    Возвращает: {"added": int, "skipped_in_rassylka": int,
+                 "skipped_stop": int, "urls_added": list[str]}.
+    """
+    sp = _get_spreadsheet()
+    rass = sp.sheet1
+
+    rass_rows = rass.get_all_values()
+    rass_urls = set()
+    for r in rass_rows[1:]:
+        if r and r[0].strip().startswith("http"):
+            rass_urls.add(_normalize_url(r[0].strip()))
+
+    stop_urls = get_stop_urls()
+
+    try:
+        base = sp.worksheet("База")
+    except Exception:
+        logger.warning("Лист База не найден — promote пропущен")
+        return {"added": 0, "skipped_in_rassylka": 0, "skipped_stop": 0, "urls_added": []}
+
+    base_rows = base.get_all_values()
+
+    skipped_in_rassylka = 0
+    skipped_stop = 0
+    new_urls: list[str] = []
+    seen_in_base: set[str] = set()
+
+    for r in base_rows[1:]:
+        if not r:
+            continue
+        url = r[0].strip()
+        if not url.startswith("http"):
+            continue
+        norm = _normalize_url(url)
+        if norm in seen_in_base:
+            continue
+        seen_in_base.add(norm)
+        if norm in rass_urls:
+            skipped_in_rassylka += 1
+            continue
+        if norm in stop_urls:
+            skipped_stop += 1
+            continue
+        new_urls.append(url)
+
+    result = {
+        "added": len(new_urls),
+        "skipped_in_rassylka": skipped_in_rassylka,
+        "skipped_stop": skipped_stop,
+        "urls_added": new_urls,
+    }
+
+    if dry_run:
+        logger.info(
+            f"[DRY-RUN] promote_base_to_rassylka: добавил бы {len(new_urls)}, "
+            f"skip in_rassylka={skipped_in_rassylka}, skip stop={skipped_stop}"
+        )
+        return result
+
+    if new_urls:
+        next_row = len(rass_rows) + 1
+        rass.update(
+            values=[[u] for u in new_urls],
+            range_name=f"A{next_row}:A{next_row + len(new_urls) - 1}",
+        )
+        logger.info(
+            f"promote_base_to_rassylka: добавлено {len(new_urls)} URL в Рассылку "
+            f"(skip in_rassylka={skipped_in_rassylka}, skip stop={skipped_stop}). "
+            f"B:E будут заполнены при следующем get_pending_sends."
+        )
+    else:
+        logger.info(
+            f"promote_base_to_rassylka: новых URL нет "
+            f"(skip in_rassylka={skipped_in_rassylka}, skip stop={skipped_stop})"
+        )
+
+    return result
