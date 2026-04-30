@@ -175,8 +175,78 @@ def _send_first_via_hint(session: requests.Session, offer_id: int, message_text:
     return result
 
 
+def _cleanup_stale_singleton_locks() -> None:
+    """
+    Aggressive cleanup перед launch_persistent_context (cian_api).
+
+    BROWSER_LOCK гарантирует что в нашем процессе только один поток держит
+    chromium → любой найденный chromium с user_data_dir=cian_storage
+    = осиротевший от прежнего креша/SIGKILL. SIGTERM → 3s → SIGKILL → unlink locks.
+
+    Раньше функция пропускала cleanup при pgrep-match → 04-30 12:00 МСК cron
+    упал 0/60 sent из-за orphan от ночного парсинга.
+    """
+    import os
+    import signal
+    import subprocess
+    import time
+    from pathlib import Path
+    storage = Path("cian_storage")
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", f"user-data-dir={storage}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        pids = [int(x) for x in result.stdout.split() if x.strip().isdigit()]
+    except Exception as e:
+        logger.warning(f"_cleanup (cian_api): pgrep err {e}")
+        pids = []
+
+    if pids:
+        logger.warning(
+            f"⚠️  CHROMIUM_ORPHAN_DETECTED (cian_api): {len(pids)} процесса "
+            f"на {storage} (PIDs: {pids}) — kill"
+        )
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except (ProcessLookupError, PermissionError):
+                pass
+        time.sleep(3)
+        for pid in pids:
+            try:
+                os.kill(pid, 0)
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        time.sleep(1)
+
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        try:
+            (storage / name).unlink(missing_ok=True)
+        except Exception:
+            pass
+    try:
+        for p in storage.glob(".org.chromium.*"):
+            try:
+                p.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if pids:
+        logger.info("✅ Cleanup завершён (cian_api)")
+
+
 def _get_browser_context():
-    """Создаёт Playwright browser context с cookies и stealth."""
+    """
+    Создаёт Playwright browser context с cookies и stealth.
+
+    Retry-логика: если launch_persistent_context падает (TargetClosedError
+    "Opening in existing browser session" обычно от orphan chromium), второй
+    проход cleanup + повторная попытка. На второй неудаче пробрасываем
+    исключение и аккуратно останавливаем playwright (избегаем p-leak).
+    """
     import time
     from pathlib import Path
     from playwright.sync_api import sync_playwright
@@ -187,8 +257,7 @@ def _get_browser_context():
         navigator_platform_override="Linux x86_64",
     )
 
-    p = sync_playwright().start()
-    context = p.chromium.launch_persistent_context(
+    launch_args = dict(
         user_data_dir=str(Path("cian_storage")),
         headless=False,
         viewport={"width": 1280, "height": 800},
@@ -204,15 +273,32 @@ def _get_browser_context():
         ],
         ignore_default_args=["--enable-automation"],
     )
-    stealth.apply_stealth_sync(context)
 
-    cookie_file = Path(SESSION_FILE)
-    if cookie_file.exists():
-        with open(cookie_file) as f:
-            cookies = json.load(f)
-        context.add_cookies(cookies)
+    last_err = None
+    for attempt in range(2):
+        _cleanup_stale_singleton_locks()
+        p = sync_playwright().start()
+        try:
+            context = p.chromium.launch_persistent_context(**launch_args)
+            stealth.apply_stealth_sync(context)
+            cookie_file = Path(SESSION_FILE)
+            if cookie_file.exists():
+                with open(cookie_file) as f:
+                    cookies = json.load(f)
+                context.add_cookies(cookies)
+            return p, context
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                f"launch_persistent_context attempt {attempt + 1}/2 failed: {e}"
+            )
+            try:
+                p.stop()
+            except Exception:
+                pass
+            time.sleep(2)
 
-    return p, context
+    raise RuntimeError(f"_get_browser_context: launch failed after 2 attempts: {last_err}")
 
 
 def refresh_session() -> dict:

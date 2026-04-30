@@ -11,6 +11,7 @@ import os
 import random
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -18,6 +19,9 @@ from dotenv import load_dotenv
 
 # Загружаем .env до импорта модулей
 load_dotenv()
+
+LAST_SEND_MARKER = Path("/root/cian-bot/.last_send_attempted")
+LOG_PATH_FOR_CATCHUP = Path("/root/cian-bot/cian_bot.log")
 
 import sheets
 import cian_api
@@ -56,6 +60,46 @@ def load_messages() -> list[str]:
     messages = [m.strip() for m in text.split("---") if m.strip()]
     logger.info(f"Загружено {len(messages)} шаблонов сообщений")
     return messages
+
+
+def _record_send_attempt():
+    """Помечает что сегодня окно отправки уже отработано (для catch-up на рестарте)."""
+    try:
+        LAST_SEND_MARKER.write_text(datetime.now().strftime("%Y-%m-%d"))
+    except Exception as e:
+        logger.warning(f"Не удалось обновить {LAST_SEND_MARKER}: {e}")
+
+
+def _today_send_already_done() -> bool:
+    """
+    True только если сегодня task_send_messages **успешно завершилась**.
+
+    Маркер обновляется в `_record_send_attempt` ПОСЛЕ цикла отправки.
+    Fallback — ищем в логе строку `Итого: отправлено N, ошибок M` за сегодня.
+    Просто старт `🚀 Запуск отправки` НЕ считается success — задача могла
+    крашнуться (например, TargetClosedError на 1-й итерации). В таком случае
+    catch-up должен сработать.
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    if LAST_SEND_MARKER.exists():
+        try:
+            if LAST_SEND_MARKER.read_text().strip() == today:
+                return True
+        except Exception:
+            pass
+    if LOG_PATH_FOR_CATCHUP.exists():
+        try:
+            with LOG_PATH_FOR_CATCHUP.open("rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(0, size - 200_000))
+                tail = f.read().decode("utf-8", errors="ignore")
+            for line in tail.splitlines():
+                if line.startswith(today) and "Итого: отправлено" in line:
+                    return True
+        except Exception:
+            pass
+    return False
 
 
 def task_send_messages():
@@ -101,10 +145,22 @@ def task_send_messages():
 
         if result["success"]:
             new_count = msg_index + 1
-            sheets.mark_sent(item["row"], new_count, days_between)
+            # mark_sent имеет 3-attempt retry внутри; если упадёт всё равно —
+            # отправка уже прошла на Циан, поэтому батч не останавливаем
+            # (alert уже отправлен из mark_sent в TG general).
+            try:
+                sheets.mark_sent(item["row"], new_count, days_between)
+            except Exception as e:
+                logger.error(
+                    f"mark_sent crashed для row={item['row']}, "
+                    f"send УЖЕ прошёл на Циан, продолжаю батч: {e}"
+                )
             sent_count += 1
             if topic_id:
-                telegram_notify.notify_send_result(topic_id, url, new_count, True)
+                try:
+                    telegram_notify.notify_send_result(topic_id, url, new_count, True)
+                except Exception as e:
+                    logger.warning(f"notify_send_result fail topic={topic_id}: {e}")
         else:
             errors_count += 1
             if topic_id:
@@ -124,6 +180,7 @@ def task_send_messages():
             time.sleep(delay)
 
     logger.info(f"Итого: отправлено {sent_count}, ошибок {errors_count}")
+    _record_send_attempt()
 
 
 def task_check_replies():
@@ -172,12 +229,35 @@ def task_check_replies():
 
 
 def task_process_collections():
-    """Задача: парсинг подборок из листа Подборки → добавление в Базу."""
+    """Задача: парсинг подборок → База, затем промоут новых URL → Рассылка."""
     logger.info("📋 Проверяю лист Подборки...")
     try:
         sheets.process_collections()
     except Exception as e:
         logger.error(f"Ошибка обработки подборок: {e}")
+
+    # Bridge: новые URL из Базы → в Рассылку (колонка A).
+    # get_pending_sends при следующем запуске инициализирует строки sent_count=0,
+    # next_send=today, status=active.
+    try:
+        result = sheets.promote_base_to_rassylka()
+        if result.get("added", 0) > 0:
+            try:
+                telegram_notify.send_to_general(
+                    f"🆕 В Рассылку добавлено {result['added']} новых объявлений из Базы"
+                )
+            except Exception as notify_err:
+                logger.warning(f"Не удалось отправить уведомление о промоуте: {notify_err}")
+    except Exception as e:
+        logger.error(f"Ошибка promote_base_to_rassylka: {e}")
+
+    # Heal: добиваем topic_id для active-строк, у которых он пустой
+    # (исторический баг: create_topic мог вернуть None, get_pending_sends
+    # больше не пытается). Лимит/паузы внутри ensure_topics.
+    try:
+        sheets.ensure_topics(pause_sec=5.0, max_per_run=30)
+    except Exception as e:
+        logger.error(f"Ошибка ensure_topics: {e}")
 
 
 def task_check_session_health():
@@ -341,6 +421,32 @@ def main():
     logger.info(f"📬 Проверка ответов: каждые {check_interval} мин")
     logger.info(f"📊 Сводка: каждый день в 20:00 МСК")
     logger.info(f"🔄 Keepalive сессии: раз в {keepalive_days} дн.")
+
+    # Catch-up: если сегодняшнее cron-окно отправки прошло, а task_send_messages
+    # ещё не отработала — догнать через 60 секунд после старта.
+    now = datetime.now()
+    today_send_at = now.replace(hour=send_hour, minute=send_minute, second=0, microsecond=0)
+    if now >= today_send_at and not _today_send_already_done():
+        catchup_at = now + timedelta(seconds=60)
+        scheduler.add_job(
+            task_send_messages,
+            "date",
+            run_date=catchup_at,
+            id="catchup_send",
+            name="Catch-up отправка сообщений",
+        )
+        logger.warning(
+            f"Cron-окно отправки в {send_hour:02d}:{send_minute:02d} пропущено сегодня, "
+            f"запланирован catch-up на {catchup_at.strftime('%H:%M:%S')} МСК"
+        )
+        try:
+            telegram_notify.send_to_general(
+                f"⏰ Сегодняшнее окно отправки ({send_hour:02d}:{send_minute:02d}) было пропущено — "
+                f"запускаю догоняющую отправку через минуту."
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить о catch-up: {e}")
+
     logger.info("")
     logger.info("Жду расписания... (Ctrl+C для остановки)")
 
